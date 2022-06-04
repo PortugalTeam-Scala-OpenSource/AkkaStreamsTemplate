@@ -1,63 +1,74 @@
-import akka.NotUsed
-import akka.actor.ActorSystem
-import akka.kafka.{ConsumerSettings, Subscriptions}
-import akka.kafka.scaladsl.Consumer
+import akka.Done
+import akka.actor.{ActorSystem, typed}
+
+import scala.language.postfixOps
+import akka.actor.typed.scaladsl.adapter._
+import akka.pattern.ask
+import akka.actor.typed.scaladsl.AskPattern._
+import akka.cluster.sharding.typed.scaladsl.ClusterSharding
 import akka.stream.scaladsl.{Sink, Source}
+import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
-import org.apache.kafka.common.serialization.{
-  StringDeserializer,
-  StringSerializer
-}
 
 import java.time.YearMonth
+import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.concurrent.duration.DurationInt
-import scala.language.postfixOps
 import scala.util.Random
 
 object Main extends App {
-  implicit val actorSystem = ActorSystem("example")
+  val config = ConfigFactory.load
+  implicit val actorSystem = ActorSystem("Example", config)
+  val typedActorSystem: typed.ActorSystem[Nothing] =
+    actorSystem.toTyped
+  implicit val ec: ExecutionContextExecutor = typedActorSystem.executionContext
+  implicit val clusterSharding: ClusterSharding =
+    ClusterSharding.apply(typedActorSystem)
 
-  case class Order(date: YearMonth)
+  // asking someone requires a timeout if the timeout hits without response
+  // the ask is failed with a TimeoutException
+  implicit val timeout: Timeout = 3.seconds
 
-  val iterator: Iterator[Order] = new Iterator[Order] {
-    override def hasNext: Boolean = true
-    override def next(): Order = Order(date =
-      YearMonth.of(Random.between(2020, 2022), Random.between(1, 12))
-    )
+  import infrastructure.actor.ShardedActor
+
+  import OrdersPerYearMonth._
+
+  val ordersPerYearMonths = {
+    implicit val e = typedActorSystem
+    ShardedActor[OrdersPerYearMonth.Commands]({ id =>
+      OrdersPerYearMonth.apply(id)(0)
+    })
+
   }
+  /*def yearOrderIterator: Iterator[YearMonth] = new Iterator[YearMonth] {
+      override def hasNext: Boolean = true
 
-  val orders: Source[Order, NotUsed] =
-    Source
-      .fromIterator(() => iterator)
-      .throttle(1, 1 second)
+      override def next(): YearMonth =
+        YearMonth.of(2021, Random.between(1, 12))
+    }*/
 
-  val now = YearMonth.now()
+  val yearOrderIterator =
+    (1 to 1000).map(_ => YearMonth.of(2021, Random.between(1, 13))).iterator
 
-  orders
-    .map { order =>
-      // Can you calculate here the difference between now and the date of the order?
-      // if so, please print on console
-      println(order)
-
-      order
+  val done: Future[Done] = Source
+    .fromIterator(() => yearOrderIterator)
+    .mapAsync(10) { yearMonth =>
+      val id = s"${yearMonth.getYear}-${yearMonth.getMonthValue}"
+      println(s"Pushing ${id}")
+      ordersPerYearMonths.ask(id)(replyTo => AddOrder(replyTo))
     }
     .runWith(Sink.ignore)
 
-  /*
-   Using Kafka
-   val consumerSettings = ConsumerSettings(
-    actorSystem,
-    new StringDeserializer,
-    new StringDeserializer
-  )
-    .withBootstrapServers("0.0.0.0:9092")
-  val subscription = Subscriptions.topics("chat")
-  Consumer
-    .plainSource(consumerSettings, subscription)
-    .map { message =>
-      println(message)
-      message
-    }
-    .runWith(Sink.foreach(println)) */
+  for {
+    _ <- done
+    responseFromA <- ordersPerYearMonths.ask("2021-12")(replyTo =>
+      HowManyOrders(replyTo)
+    )
+    responseFromB <- ordersPerYearMonths.ask("2021-1")(replyTo =>
+      HowManyOrders(replyTo)
+    )
+  } yield {
+    println(s"2021-12: ${responseFromA}")
+    println(s"2022-1: ${responseFromB}")
+  }
 
 }
